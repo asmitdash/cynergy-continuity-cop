@@ -2,20 +2,12 @@
  * Extract chapters from a PDF buffer.
  *
  * Strategy:
- *  1. Extract raw text with pdf-parse.
+ *  1. Extract raw text with pdf-parse v2 (PDFParse class).
  *  2. Try to split on chapter markers (Chapter 1, CHAPTER I, Part 1, Book 1, etc.).
  *  3. If no markers found, fall back to fixed-size chunks (~3500 words each).
  */
 
-import * as pdfParseModule from "pdf-parse";
-
-type PdfParseFn = (
-  data: Buffer | Uint8Array | ArrayBuffer,
-) => Promise<{ numpages: number; text: string }>;
-
-const pdfParse: PdfParseFn =
-  ((pdfParseModule as unknown as { default?: PdfParseFn }).default ??
-    (pdfParseModule as unknown as PdfParseFn));
+import { PDFParse } from "pdf-parse";
 
 export interface ExtractedChapter {
   title: string;
@@ -24,19 +16,18 @@ export interface ExtractedChapter {
 }
 
 const CHAPTER_REGEXES: RegExp[] = [
-  // "Chapter 1", "Chapter One", "CHAPTER I"
   /^\s*(Chapter|CHAPTER)\s+(\d+|[IVXLCDM]+|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|Eleven|Twelve|Thirteen|Fourteen|Fifteen|Sixteen|Seventeen|Eighteen|Nineteen|Twenty)\b[^\n]*$/im,
-  // "Part 1", "PART I"
   /^\s*(Part|PART)\s+(\d+|[IVXLCDM]+|One|Two|Three|Four|Five)\b[^\n]*$/im,
-  // "Book 1"
   /^\s*(Book|BOOK)\s+(\d+|[IVXLCDM]+)\b[^\n]*$/im,
 ];
 
 const TARGET_CHUNK_WORDS = 3500;
 
 function splitByMarker(text: string, re: RegExp): ExtractedChapter[] | null {
-  // Find all match positions with a global variant.
-  const globalRe = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
+  const globalRe = new RegExp(
+    re.source,
+    re.flags.includes("g") ? re.flags : re.flags + "g",
+  );
   const positions: Array<{ index: number; heading: string }> = [];
   let m: RegExpExecArray | null;
   while ((m = globalRe.exec(text)) !== null) {
@@ -84,10 +75,23 @@ export async function extractChapters(
   totalWords: number;
   strategy: "chapter-marker" | "fixed-chunk" | "single";
 }> {
-  const parsed = await pdfParse(buffer);
-  const text = parsed.text.trim();
+  // pdf-parse v2 API — PDFParse instance with getText() method
+  const parser = new PDFParse({ data: new Uint8Array(buffer) });
+  let text = "";
+  let totalPages = 0;
+  try {
+    const info = await parser.getInfo();
+    totalPages = info?.total ?? 0;
+    const result = await parser.getText();
+    text = (result?.text ?? "").trim();
+  } finally {
+    try {
+      await parser.destroy();
+    } catch {
+      /* ignore */
+    }
+  }
 
-  // Try each marker regex; keep the split that yields the most chapters.
   let best: { chapters: ExtractedChapter[]; strategy: "chapter-marker" } | null = null;
   for (const re of CHAPTER_REGEXES) {
     const split = splitByMarker(text, re);
@@ -99,7 +103,7 @@ export async function extractChapters(
   if (best && best.chapters.length >= 2) {
     return {
       chapters: best.chapters,
-      totalPages: parsed.numpages,
+      totalPages,
       totalWords: text.split(/\s+/).filter(Boolean).length,
       strategy: "chapter-marker",
     };
@@ -115,7 +119,7 @@ export async function extractChapters(
           wordCount,
         },
       ],
-      totalPages: parsed.numpages,
+      totalPages,
       totalWords: wordCount,
       strategy: "single",
     };
@@ -123,7 +127,7 @@ export async function extractChapters(
 
   return {
     chapters: splitByWordCount(text),
-    totalPages: parsed.numpages,
+    totalPages,
     totalWords: wordCount,
     strategy: "fixed-chunk",
   };
