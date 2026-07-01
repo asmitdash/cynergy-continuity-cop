@@ -43,3 +43,5 @@ next-env.d.ts
 .vercel
 context.md
 .env.local
+
+.env*

@@ -2,6 +2,7 @@
 
 import { useRef, useState } from "react";
 import Link from "next/link";
+import { upload } from "@vercel/blob/client";
 import { Brain, ArrowLeft, Upload, FileText } from "lucide-react";
 import { VerbPill, type CogneeVerb } from "@/components/VerbPill";
 
@@ -9,6 +10,20 @@ type Mode = "paste" | "file";
 
 const ACCEPTED = ".pdf,.doc,.docx,.txt,.md,.markdown,.rtf,.odt";
 const ACCEPTED_LABEL = "PDF, DOC, DOCX, TXT, MD, RTF, ODT";
+
+async function readErrorMessage(res: Response): Promise<string> {
+  const ct = res.headers.get("content-type") ?? "";
+  if (ct.includes("application/json")) {
+    try {
+      const body = (await res.json()) as { error?: string; message?: string };
+      return body.error ?? body.message ?? `${res.status} ${res.statusText}`;
+    } catch {
+      /* fall through */
+    }
+  }
+  const text = await res.text();
+  return text.slice(0, 300) || `${res.status} ${res.statusText}`;
+}
 
 export default function IngestPage() {
   const [mode, setMode] = useState<Mode>("paste");
@@ -30,8 +45,8 @@ export default function IngestPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, content, order: Date.now() }),
       });
+      if (!res.ok) throw new Error(await readErrorMessage(res));
       const body = await res.json();
-      if (!res.ok) throw new Error(body.error || "ingest failed");
       setResult(
         `Chapter ingested. status=${body.status} · items_processed=${body.items_processed} · ${body.elapsed_seconds?.toFixed(1)}s`,
       );
@@ -49,18 +64,29 @@ export default function IngestPage() {
     setVerb("remember");
     setResult(null);
     try {
-      const form = new FormData();
-      form.append("file", file);
-      form.append("order", String(Date.now()));
-      if (title.trim()) form.append("title", title);
-      const res = await fetch("/api/chapters/upload", {
-        method: "POST",
-        body: form,
+      // Step 1: client-direct upload to Vercel Blob (no 4.5 MB serverless cap).
+      setResult(`Uploading ${file.name} (${(file.size / 1024).toFixed(0)} KB)…`);
+      const blob = await upload(file.name, file, {
+        access: "public",
+        handleUploadUrl: "/api/blob",
       });
+
+      // Step 2: tell our server to fetch the blob and hand it to Cognee.
+      setResult("Uploaded. Ingesting into Cognee…");
+      const res = await fetch("/api/chapters/ingest-blob", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          blob_url: blob.url,
+          filename: file.name,
+          order: Date.now(),
+          title: title.trim() || undefined,
+        }),
+      });
+      if (!res.ok) throw new Error(await readErrorMessage(res));
       const body = await res.json();
-      if (!res.ok) throw new Error(body.error || "upload failed");
       setResult(
-        `${body.filename} ingested. type=${body.extension} · status=${body.status} · items_processed=${body.items_processed} · ${body.elapsed_seconds?.toFixed(1)}s`,
+        `${body.filename} ingested. type=${body.extension || "?"} · size=${(body.size_bytes / 1024).toFixed(0)} KB · status=${body.status}${body.pipeline_run_id ? ` · pipeline=${body.pipeline_run_id.slice(0, 8)}` : ""}`,
       );
       setFile(null);
       setTitle("");
