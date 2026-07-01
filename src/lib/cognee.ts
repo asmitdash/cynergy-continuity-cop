@@ -124,33 +124,75 @@ export interface RememberInput {
   customPrompt?: string;
 }
 
+/**
+ * Hand-built multipart POST for Cognee's /api/v1/remember/.
+ *
+ * WHY: Node undici's built-in FormData + fetch combination produces a
+ * multipart body that Cognee's FastAPI parser rejects with
+ * `{"detail":"There was an error parsing the body"}`, even though the
+ * fields match exactly what curl sends successfully. Writing the body
+ * ourselves works. Verified end-to-end 2026-07-02.
+ */
 export async function remember(input: RememberInput): Promise<RememberResult> {
-  const form = new FormData();
+  const boundary =
+    "----CogneeBoundary" +
+    Math.random().toString(16).slice(2) +
+    Date.now().toString(16);
+  const CRLF = "\r\n";
+  const parts: Buffer[] = [];
+  const pushText = (s: string) => parts.push(Buffer.from(s, "utf8"));
+  const pushRaw = (b: Buffer) => parts.push(b);
 
-  if (input.data instanceof Blob) {
-    // Cognee's multipart parser requires a filename on the file part.
-    // If it's a File, its name is used; otherwise fall back to a sensible default.
-    const filename =
-      input.data instanceof File ? input.data.name : "upload.bin";
-    form.append("data", input.data, filename);
-  } else {
-    const blob = new Blob([input.data.text], { type: "text/markdown" });
-    form.append("data", blob, input.data.filename ?? "note.md");
-  }
-  if (input.datasetId) form.append("datasetId", input.datasetId);
-  if (input.datasetName) form.append("datasetName", input.datasetName);
-  if (input.nodeSet) form.append("node_set", JSON.stringify(input.nodeSet));
+  const addField = (name: string, value: string) => {
+    pushText(`--${boundary}${CRLF}`);
+    pushText(`Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}`);
+    pushText(`${value}${CRLF}`);
+  };
+
+  // Scalar fields first
+  if (input.datasetId) addField("datasetId", input.datasetId);
+  if (input.datasetName) addField("datasetName", input.datasetName);
+  if (input.nodeSet) addField("node_set", JSON.stringify(input.nodeSet));
   if (typeof input.runInBackground === "boolean")
-    form.append("run_in_background", String(input.runInBackground));
-  if (input.contentType) form.append("content_type", input.contentType);
+    addField("run_in_background", String(input.runInBackground));
+  if (input.contentType) addField("content_type", input.contentType);
   if (input.ontologyKey)
-    input.ontologyKey.forEach((k) => form.append("ontology_key", k));
-  if (input.customPrompt) form.append("custom_prompt", input.customPrompt);
+    input.ontologyKey.forEach((k) => addField("ontology_key", k));
+  if (input.customPrompt) addField("custom_prompt", input.customPrompt);
+
+  // File field last
+  let filename = "upload.bin";
+  let mime = "application/octet-stream";
+  let bytes: Buffer;
+  if (input.data instanceof Blob) {
+    if (input.data instanceof File) filename = input.data.name || filename;
+    mime = input.data.type || mime;
+    const ab = await input.data.arrayBuffer();
+    bytes = Buffer.from(ab);
+  } else {
+    filename = input.data.filename ?? "note.md";
+    mime = "text/markdown";
+    bytes = Buffer.from(input.data.text, "utf8");
+  }
+  pushText(`--${boundary}${CRLF}`);
+  pushText(
+    `Content-Disposition: form-data; name="data"; filename="${filename}"${CRLF}`,
+  );
+  pushText(`Content-Type: ${mime}${CRLF}${CRLF}`);
+  pushRaw(bytes);
+  pushText(CRLF);
+  pushText(`--${boundary}--${CRLF}`);
+
+  const body = Buffer.concat(parts);
 
   const res = await fetch(`${BASE_URL}/api/v1/remember/`, {
     method: "POST",
-    headers: headers(),
-    body: form,
+    headers: {
+      ...headers(),
+      "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      "Content-Length": String(body.length),
+    },
+    body,
     redirect: "follow",
   });
   if (!res.ok) throw new Error(`remember ${res.status}: ${await res.text()}`);
