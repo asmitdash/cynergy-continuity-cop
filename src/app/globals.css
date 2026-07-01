@@ -1,0 +1,104 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #0a0a0b;
+  --surface: #141416;
+  --surface-elevated: #1c1c1f;
+  --text-primary: #ededef;
+  --text-secondary: #a1a1a8;
+  --text-muted: #626269;
+  --accent: #8b7fff;
+  --accent-hover: #a598ff;
+  --warning: #ff9f43;
+  --contradiction: #ff6b6b;
+  --citation: #4a9eff;
+  --retcon: #9b59b6;
+  --success: #51cf66;
+  --border: #2a2a2e;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  min-height: 100vh;
+}
+
+* { box-sizing: border-box; }
+
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+}
+.card-elevated {
+  background: var(--surface-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+}
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  gap: 8px; padding: 10px 18px; border-radius: 10px;
+  font-weight: 500; font-size: 14px; cursor: pointer;
+  transition: all 150ms ease; border: 1px solid transparent;
+}
+.btn-primary { background: var(--accent); color: white; }
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+.btn-ghost { background: transparent; color: var(--text-primary); border-color: var(--border); }
+.btn-ghost:hover:not(:disabled) { background: var(--surface); }
+.btn-destructive { background: var(--contradiction); color: white; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.textarea, .input {
+  width: 100%; background: var(--surface); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 14px; font-size: 15px; line-height: 1.5;
+  font-family: inherit; resize: vertical; transition: border-color 120ms ease;
+}
+.textarea:focus, .input:focus { outline: none; border-color: var(--accent); }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 500;
+  background: var(--surface-elevated); color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+.badge-flag {
+  background: color-mix(in oklab, var(--contradiction) 15%, transparent);
+  color: var(--contradiction);
+  border-color: color-mix(in oklab, var(--contradiction) 30%, transparent);
+}
+.badge-success {
+  background: color-mix(in oklab, var(--success) 15%, transparent);
+  color: var(--success);
+  border-color: color-mix(in oklab, var(--success) 30%, transparent);
+}
+.badge-cognee {
+  background: color-mix(in oklab, var(--accent) 15%, transparent);
+  color: var(--accent);
+  border-color: color-mix(in oklab, var(--accent) 40%, transparent);
+}
+
+.verb-pill {
+  position: fixed; top: 16px; right: 16px; z-index: 50;
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 12px; border-radius: 999px;
+  background: color-mix(in oklab, var(--accent) 20%, var(--surface-elevated));
+  color: var(--accent);
+  border: 1px solid color-mix(in oklab, var(--accent) 40%, transparent);
+  font-size: 12px; font-weight: 500;
+}
+
+.evidence {
+  background: var(--surface-elevated);
+  border-left: 4px solid var(--citation);
+  padding: 12px 14px; border-radius: 8px; margin-top: 10px; font-size: 14px;
+}
+.evidence-label {
+  font-size: 12px; font-family: ui-monospace, monospace;
+  color: var(--citation); margin-bottom: 6px;
+}

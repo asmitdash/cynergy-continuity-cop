@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<rdf:RDF xmlns="http://continuity-cop.dev/ontology#"
+     xml:base="http://continuity-cop.dev/ontology"
+     xmlns:owl="http://www.w3.org/2002/07/owl#"
+     xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+     xmlns:xsd="http://www.w3.org/2001/XMLSchema#"
+     xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#">
+
+  <owl:Ontology rdf:about="http://continuity-cop.dev/ontology"/>
+
+  <!-- ============ CLASSES ============ -->
+  <owl:Class rdf:about="#Character"/>
+  <owl:Class rdf:about="#Location"/>
+  <owl:Class rdf:about="#Event"/>
+  <owl:Class rdf:about="#Prop"/>
+  <owl:Class rdf:about="#EstablishedFact"/>
+  <owl:Class rdf:about="#Relationship"/>
+  <owl:Class rdf:about="#TemporalMarker"/>
+  <owl:Class rdf:about="#Chapter"/>
+
+  <!-- ============ OBJECT PROPERTIES ============ -->
+  <owl:ObjectProperty rdf:about="#references">
+    <rdfs:domain rdf:resource="#EstablishedFact"/>
+    <rdfs:range rdf:resource="#EstablishedFact"/>
+  </owl:ObjectProperty>
+
+  <owl:ObjectProperty rdf:about="#occurs_in">
+    <rdfs:domain rdf:resource="#Event"/>
+    <rdfs:range rdf:resource="#Location"/>
+  </owl:ObjectProperty>
+
+  <owl:ObjectProperty rdf:about="#contradicts">
+    <rdfs:domain rdf:resource="#EstablishedFact"/>
+    <rdfs:range rdf:resource="#EstablishedFact"/>
+  </owl:ObjectProperty>
+
+  <owl:ObjectProperty rdf:about="#revised_by">
+    <rdfs:domain rdf:resource="#EstablishedFact"/>
+    <rdfs:range rdf:resource="#EstablishedFact"/>
+  </owl:ObjectProperty>
+
+  <owl:ObjectProperty rdf:about="#established_by">
+    <rdfs:domain rdf:resource="#EstablishedFact"/>
+    <rdfs:range rdf:resource="#Event"/>
+  </owl:ObjectProperty>
+
+  <owl:ObjectProperty rdf:about="#involves_character">
+    <rdfs:domain rdf:resource="#Event"/>
+    <rdfs:range rdf:resource="#Character"/>
+  </owl:ObjectProperty>
+
+  <owl:ObjectProperty rdf:about="#occurs_at_time">
+    <rdfs:domain rdf:resource="#Event"/>
+    <rdfs:range rdf:resource="#TemporalMarker"/>
+  </owl:ObjectProperty>
+
+  <owl:ObjectProperty rdf:about="#appears_in_chapter">
+    <rdfs:domain rdf:resource="#Character"/>
+    <rdfs:range rdf:resource="#Chapter"/>
+  </owl:ObjectProperty>
+
+  <!-- ============ DATA PROPERTIES ============ -->
+  <owl:DatatypeProperty rdf:about="#canonical_name">
+    <rdfs:domain rdf:resource="#Character"/>
+    <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#string"/>
+  </owl:DatatypeProperty>
+
+  <owl:DatatypeProperty rdf:about="#first_appearance">
+    <rdfs:domain rdf:resource="#Character"/>
+    <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#string"/>
+  </owl:DatatypeProperty>
+
+  <owl:DatatypeProperty rdf:about="#confidence_score">
+    <rdfs:domain rdf:resource="#EstablishedFact"/>
+    <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#float"/>
+  </owl:DatatypeProperty>
+
+  <owl:DatatypeProperty rdf:about="#chapter_ref">
+    <rdfs:domain rdf:resource="#EstablishedFact"/>
+    <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#string"/>
+  </owl:DatatypeProperty>
+
+  <owl:DatatypeProperty rdf:about="#line_ref">
+    <rdfs:domain rdf:resource="#EstablishedFact"/>
+    <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#integer"/>
+  </owl:DatatypeProperty>
+
+  <owl:DatatypeProperty rdf:about="#chapter_order">
+    <rdfs:domain rdf:resource="#Chapter"/>
+    <rdfs:range rdf:resource="http://www.w3.org/2001/XMLSchema#integer"/>
+  </owl:DatatypeProperty>
+
+</rdf:RDF>
