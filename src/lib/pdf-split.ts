@@ -1,13 +1,16 @@
 /**
  * Extract chapters from a PDF buffer.
  *
+ * Uses `unpdf` — a serverless-safe wrapper over pdfjs that ships without
+ * the canvas + DOMMatrix requirements. Works on Vercel.
+ *
  * Strategy:
- *  1. Extract raw text with pdf-parse v2 (PDFParse class).
- *  2. Try to split on chapter markers (Chapter 1, CHAPTER I, Part 1, Book 1, etc.).
- *  3. If no markers found, fall back to fixed-size chunks (~3500 words each).
+ *  1. Extract raw text with unpdf.
+ *  2. Try to split on chapter markers.
+ *  3. Fall back to fixed-size chunks (~3500 words each).
  */
 
-import { PDFParse } from "pdf-parse";
+import { extractText, getDocumentProxy } from "unpdf";
 
 export interface ExtractedChapter {
   title: string;
@@ -75,22 +78,10 @@ export async function extractChapters(
   totalWords: number;
   strategy: "chapter-marker" | "fixed-chunk" | "single";
 }> {
-  // pdf-parse v2 API — PDFParse instance with getText() method
-  const parser = new PDFParse({ data: new Uint8Array(buffer) });
-  let text = "";
-  let totalPages = 0;
-  try {
-    const info = await parser.getInfo();
-    totalPages = info?.total ?? 0;
-    const result = await parser.getText();
-    text = (result?.text ?? "").trim();
-  } finally {
-    try {
-      await parser.destroy();
-    } catch {
-      /* ignore */
-    }
-  }
+  const doc = await getDocumentProxy(new Uint8Array(buffer));
+  const totalPages = doc.numPages;
+  const { text: rawText } = await extractText(doc, { mergePages: true });
+  const text = (Array.isArray(rawText) ? rawText.join("\n") : rawText).trim();
 
   let best: { chapters: ExtractedChapter[]; strategy: "chapter-marker" } | null = null;
   for (const re of CHAPTER_REGEXES) {
