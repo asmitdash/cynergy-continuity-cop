@@ -128,7 +128,11 @@ export async function remember(input: RememberInput): Promise<RememberResult> {
   const form = new FormData();
 
   if (input.data instanceof Blob) {
-    form.append("data", input.data);
+    // Cognee's multipart parser requires a filename on the file part.
+    // If it's a File, its name is used; otherwise fall back to a sensible default.
+    const filename =
+      input.data instanceof File ? input.data.name : "upload.bin";
+    form.append("data", input.data, filename);
   } else {
     const blob = new Blob([input.data.text], { type: "text/markdown" });
     form.append("data", blob, input.data.filename ?? "note.md");
