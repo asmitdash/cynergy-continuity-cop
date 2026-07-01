@@ -1,9 +1,17 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { upload } from "@vercel/blob/client";
-import { Brain, ArrowLeft, Upload, FileText } from "lucide-react";
+import {
+  Brain,
+  ArrowLeft,
+  Upload,
+  FileText,
+  CheckCircle,
+  AlertTriangle,
+  Loader,
+} from "lucide-react";
 import { VerbPill, type CogneeVerb } from "@/components/VerbPill";
 
 type Mode = "paste" | "file";
@@ -25,6 +33,22 @@ async function readErrorMessage(res: Response): Promise<string> {
   return text.slice(0, 300) || `${res.status} ${res.statusText}`;
 }
 
+interface Flag {
+  new_scene_span: string;
+  contradicts_fact: string;
+  contradiction_kind: string;
+  explanation: string;
+  confidence: number;
+}
+
+interface ChapterState {
+  index: number;
+  title: string;
+  wordCount?: number;
+  phase: "pending" | "ingesting" | "ingested" | "analyzing" | "error";
+  errorMsg?: string;
+}
+
 export default function IngestPage() {
   const [mode, setMode] = useState<Mode>("paste");
   const [title, setTitle] = useState("");
@@ -34,6 +58,24 @@ export default function IngestPage() {
   const [verb, setVerb] = useState<CogneeVerb>(null);
   const [result, setResult] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Streaming state for file ingest
+  const [streaming, setStreaming] = useState(false);
+  const [statusLine, setStatusLine] = useState<string | null>(null);
+  const [totalChapters, setTotalChapters] = useState<number>(0);
+  const [chapterStates, setChapterStates] = useState<ChapterState[]>([]);
+  const [flags, setFlags] = useState<Flag[]>([]);
+  const [flagsAfterTitle, setFlagsAfterTitle] = useState<string | null>(null);
+  const [strategy, setStrategy] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  // Auto-scroll progress into view when it starts
+  const progressRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (streaming && progressRef.current) {
+      progressRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [streaming]);
 
   async function ingestText() {
     if (!title.trim() || !content.trim()) return;
@@ -59,42 +101,148 @@ export default function IngestPage() {
     }
   }
 
+  function resetStreamState() {
+    setStreaming(false);
+    setStatusLine(null);
+    setTotalChapters(0);
+    setChapterStates([]);
+    setFlags([]);
+    setFlagsAfterTitle(null);
+    setStrategy(null);
+    setDone(false);
+  }
+
   async function ingestFile() {
     if (!file) return;
     setVerb("remember");
-    setResult(null);
+    resetStreamState();
+    setStreaming(true);
+
     try {
-      // Step 1: client-direct upload to Vercel Blob (no 4.5 MB serverless cap).
-      setResult(`Uploading ${file.name} (${(file.size / 1024).toFixed(0)} KB)…`);
+      // Step 1: client-direct upload to Vercel Blob
+      setStatusLine(`Uploading ${file.name} (${(file.size / 1024).toFixed(0)} KB)…`);
       const blob = await upload(file.name, file, {
         access: "public",
         handleUploadUrl: "/api/blob",
       });
 
-      // Step 2: tell our server to fetch the blob and hand it to Cognee.
-      setResult("Uploaded. Ingesting into Cognee…");
-      const res = await fetch("/api/chapters/ingest-blob", {
+      setStatusLine("Uploaded. Streaming chapter ingestion…");
+
+      // Step 2: open SSE stream
+      const res = await fetch("/api/chapters/stream-ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           blob_url: blob.url,
           filename: file.name,
-          order: Date.now(),
-          title: title.trim() || undefined,
         }),
       });
-      if (!res.ok) throw new Error(await readErrorMessage(res));
-      const body = await res.json();
-      setResult(
-        `${body.filename} ingested. type=${body.extension || "?"} · size=${(body.size_bytes / 1024).toFixed(0)} KB · status=${body.status}${body.pipeline_run_id ? ` · pipeline=${body.pipeline_run_id.slice(0, 8)}` : ""}`,
-      );
-      setFile(null);
-      setTitle("");
-      if (fileInputRef.current) fileInputRef.current.value = "";
+      if (!res.ok || !res.body) {
+        throw new Error(await readErrorMessage(res));
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      // Parse SSE frames
+      while (true) {
+        const { done: readerDone, value } = await reader.read();
+        if (readerDone) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Split on double-newline (SSE frame separator)
+        const frames = buffer.split(/\r?\n\r?\n/);
+        buffer = frames.pop() ?? "";
+
+        for (const frame of frames) {
+          if (!frame.trim()) continue;
+          let event = "message";
+          let dataStr = "";
+          for (const line of frame.split(/\r?\n/)) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataStr += line.slice(5).trim();
+          }
+          if (!dataStr) continue;
+          let data: Record<string, unknown> = {};
+          try {
+            data = JSON.parse(dataStr) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+          handleEvent(event, data);
+        }
+      }
     } catch (e) {
-      setResult(`Error: ${e instanceof Error ? e.message : String(e)}`);
+      setStatusLine(`Error: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setVerb(null);
+      // Don't wipe stream state — user wants to see the results.
+    }
+  }
+
+  function handleEvent(event: string, data: Record<string, unknown>) {
+    switch (event) {
+      case "status": {
+        const message = data.message as string | undefined;
+        if (message) setStatusLine(message);
+        return;
+      }
+      case "split": {
+        const total = Number(data.totalChapters) || 0;
+        const titles = (data.titles as string[]) ?? [];
+        const strat = data.strategy as string | undefined;
+        setTotalChapters(total);
+        setStrategy(strat ?? null);
+        setChapterStates(
+          titles.map((t, i) => ({ index: i, title: t, phase: "pending" })),
+        );
+        setStatusLine(
+          `${total} chapter${total === 1 ? "" : "s"} detected (${strat}). Ingesting…`,
+        );
+        return;
+      }
+      case "progress": {
+        const index = Number(data.index) || 0;
+        const phase = data.phase as string | undefined;
+        setChapterStates((prev) => {
+          const next = [...prev];
+          if (!next[index]) return prev;
+          if (phase === "ingest") next[index] = { ...next[index], phase: "ingesting" };
+          else if (phase === "ingested")
+            next[index] = { ...next[index], phase: "ingested" };
+          else if (phase === "analyze")
+            next[index] = { ...next[index], phase: "analyzing" };
+          return next;
+        });
+        return;
+      }
+      case "contradictions": {
+        const incomingFlags = (data.flags as Flag[]) ?? [];
+        const afterTitle = data.afterTitle as string | undefined;
+        setFlags(incomingFlags);
+        setFlagsAfterTitle(afterTitle ?? null);
+        return;
+      }
+      case "error": {
+        const index = data.index as number | undefined;
+        const message = String(data.message ?? "unknown error");
+        if (typeof index === "number") {
+          setChapterStates((prev) => {
+            const next = [...prev];
+            if (next[index]) next[index] = { ...next[index], phase: "error", errorMsg: message };
+            return next;
+          });
+        } else {
+          setStatusLine(`Error: ${message}`);
+        }
+        return;
+      }
+      case "done": {
+        setDone(true);
+        setStatusLine("Ingestion complete.");
+        return;
+      }
     }
   }
 
@@ -105,8 +253,14 @@ export default function IngestPage() {
     if (dropped) setFile(dropped);
   }
 
+  const ingestedCount = chapterStates.filter(
+    (c) => c.phase === "ingested" || c.phase === "analyzing",
+  ).length;
+  const progressPct =
+    totalChapters === 0 ? 0 : Math.round((ingestedCount / totalChapters) * 100);
+
   return (
-    <main style={{ maxWidth: 800, margin: "0 auto", padding: "60px 24px" }}>
+    <main style={{ maxWidth: 860, margin: "0 auto", padding: "60px 24px" }}>
       <VerbPill verb={verb} />
       <Link
         href="/"
@@ -120,6 +274,7 @@ export default function IngestPage() {
       </h1>
       <p style={{ color: "var(--text-secondary)", marginBottom: 24 }}>
         Cognee will extract characters, locations, events, and facts into your story&apos;s memory graph.
+        Large documents are split into chapters and streamed one at a time.
       </p>
 
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
@@ -171,20 +326,23 @@ export default function IngestPage() {
           >
             <Upload size={16} /> {verb === "remember" ? "Remembering…" : "Ingest with cognee.remember()"}
           </button>
+          {result && (
+            <div
+              className="mono"
+              style={{
+                fontSize: 13,
+                color: "var(--text-secondary)",
+                background: "var(--surface-elevated)",
+                padding: 12,
+                borderRadius: 8,
+              }}
+            >
+              {result}
+            </div>
+          )}
         </div>
       ) : (
         <div className="card" style={{ display: "grid", gap: 16 }}>
-          <div>
-            <label style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 6, display: "block" }}>
-              Chapter title (optional — defaults to filename)
-            </label>
-            <input
-              className="input"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="e.g. Chapter 7 — The Waterfront"
-            />
-          </div>
           <div>
             <label style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 6, display: "block" }}>
               File
@@ -234,27 +392,193 @@ export default function IngestPage() {
               />
             </div>
           </div>
-          <button className="btn btn-primary" onClick={ingestFile} disabled={!file || verb !== null}>
-            <Upload size={16} /> {verb === "remember" ? "Remembering…" : "Upload & Ingest"}
+          <button className="btn btn-primary" onClick={ingestFile} disabled={!file || streaming}>
+            <Upload size={16} /> {streaming ? "Streaming…" : "Upload & Stream Ingest"}
           </button>
         </div>
       )}
 
-      {result && (
-        <div
-          className="mono"
-          style={{
-            marginTop: 20,
-            fontSize: 13,
-            color: "var(--text-secondary)",
-            background: "var(--surface-elevated)",
-            padding: 12,
-            borderRadius: 8,
-          }}
-        >
-          {result}
+      {(streaming || chapterStates.length > 0) && (
+        <div ref={progressRef} style={{ marginTop: 24 }}>
+          <ProgressPanel
+            statusLine={statusLine}
+            totalChapters={totalChapters}
+            chapterStates={chapterStates}
+            progressPct={progressPct}
+            strategy={strategy}
+            done={done}
+          />
+          {flags.length > 0 && (
+            <ContradictionsPanel flags={flags} afterTitle={flagsAfterTitle} />
+          )}
         </div>
       )}
     </main>
+  );
+}
+
+function ProgressPanel({
+  statusLine,
+  totalChapters,
+  chapterStates,
+  progressPct,
+  strategy,
+  done,
+}: {
+  statusLine: string | null;
+  totalChapters: number;
+  chapterStates: ChapterState[];
+  progressPct: number;
+  strategy: string | null;
+  done: boolean;
+}) {
+  return (
+    <div className="card" style={{ display: "grid", gap: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>
+            {done ? "Ingestion complete" : "Streaming ingestion"}
+          </div>
+          {statusLine && (
+            <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+              {statusLine}
+            </div>
+          )}
+        </div>
+        {totalChapters > 0 && (
+          <div style={{ textAlign: "right" }}>
+            <div className="mono" style={{ fontSize: 18, fontWeight: 700, color: "var(--success, #51cf66)" }}>
+              {progressPct}%
+            </div>
+            <div className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              {chapterStates.filter((c) => c.phase === "ingested" || c.phase === "analyzing").length}/{totalChapters}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div
+        style={{
+          width: "100%",
+          height: 8,
+          background: "var(--surface-elevated)",
+          borderRadius: 999,
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            width: `${progressPct}%`,
+            height: "100%",
+            background:
+              "linear-gradient(90deg, var(--success, #51cf66), var(--accent, #8b7fff))",
+            transition: "width 400ms ease",
+          }}
+        />
+      </div>
+
+      {strategy && (
+        <div className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+          Split strategy: {strategy}
+        </div>
+      )}
+
+      {chapterStates.length > 0 && (
+        <div style={{ display: "grid", gap: 4, maxHeight: 240, overflowY: "auto", paddingRight: 4 }}>
+          {chapterStates.map((c) => (
+            <ChapterRow key={c.index} state={c} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChapterRow({ state }: { state: ChapterState }) {
+  const iconFor = () => {
+    switch (state.phase) {
+      case "ingested":
+        return <CheckCircle size={14} color="var(--success, #51cf66)" />;
+      case "analyzing":
+        return <Loader size={14} className="spin" color="var(--accent, #8b7fff)" />;
+      case "ingesting":
+        return <Loader size={14} className="spin" color="var(--accent, #8b7fff)" />;
+      case "error":
+        return <AlertTriangle size={14} color="var(--contradiction, #ff6b6b)" />;
+      default:
+        return (
+          <div
+            style={{
+              width: 12,
+              height: 12,
+              borderRadius: 999,
+              border: "1.5px solid var(--text-muted)",
+              opacity: 0.4,
+            }}
+          />
+        );
+    }
+  };
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "20px 1fr auto",
+        alignItems: "center",
+        gap: 10,
+        padding: "6px 0",
+        fontSize: 13,
+      }}
+    >
+      {iconFor()}
+      <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {state.title}
+      </div>
+      <div className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+        {state.phase === "error" ? state.errorMsg ?? "error" : state.phase}
+      </div>
+      <style>{`.spin { animation: spin 1s linear infinite; } @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
+function ContradictionsPanel({ flags, afterTitle }: { flags: Flag[]; afterTitle: string | null }) {
+  return (
+    <div className="card" style={{ marginTop: 16, borderColor: "var(--contradiction, #ff6b6b)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+        <AlertTriangle size={18} color="var(--contradiction, #ff6b6b)" />
+        <div>
+          <div style={{ fontWeight: 600 }}>
+            {flags.length} contradiction{flags.length === 1 ? "" : "s"} so far
+          </div>
+          {afterTitle && (
+            <div className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              after: {afterTitle}
+            </div>
+          )}
+        </div>
+      </div>
+      <div style={{ display: "grid", gap: 10 }}>
+        {flags.map((f, i) => (
+          <div
+            key={i}
+            style={{
+              background: "var(--surface-elevated)",
+              padding: 12,
+              borderRadius: 8,
+              borderLeft: "3px solid var(--contradiction, #ff6b6b)",
+            }}
+          >
+            <div className="mono" style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>
+              {f.contradiction_kind} · {Math.round((f.confidence ?? 0) * 100)}% confidence
+            </div>
+            <div style={{ fontSize: 14, fontStyle: "italic", marginBottom: 6 }}>
+              &ldquo;{f.new_scene_span}&rdquo;
+            </div>
+            <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>{f.explanation}</div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
