@@ -67,6 +67,8 @@ export default function IngestPage() {
   const [flags, setFlags] = useState<Flag[]>([]);
   const [flagsAfterTitle, setFlagsAfterTitle] = useState<string | null>(null);
   const [strategy, setStrategy] = useState<string | null>(null);
+  const [analysisMode, setAnalysisMode] = useState<string | null>(null);
+  const [analyzerPasses, setAnalyzerPasses] = useState<number>(0);
   const [done, setDone] = useState(false);
 
   // Auto-scroll progress into view when it starts
@@ -109,6 +111,8 @@ export default function IngestPage() {
     setFlags([]);
     setFlagsAfterTitle(null);
     setStrategy(null);
+    setAnalysisMode(null);
+    setAnalyzerPasses(0);
     setDone(false);
   }
 
@@ -192,13 +196,19 @@ export default function IngestPage() {
         const total = Number(data.totalChapters) || 0;
         const titles = (data.titles as string[]) ?? [];
         const strat = data.strategy as string | undefined;
+        const mode = data.analysisMode as string | undefined;
         setTotalChapters(total);
         setStrategy(strat ?? null);
+        setAnalysisMode(mode ?? null);
         setChapterStates(
           titles.map((t, i) => ({ index: i, title: t, phase: "pending" })),
         );
+        const modeNote =
+          mode === "final-pass"
+            ? "Large doc — one final contradiction sweep at the end (saves credits)."
+            : "Rolling contradiction analysis after each chapter.";
         setStatusLine(
-          `${total} chapter${total === 1 ? "" : "s"} detected (${strat}). Ingesting…`,
+          `${total} chapter${total === 1 ? "" : "s"} detected (${strat}). ${modeNote}`,
         );
         return;
       }
@@ -208,11 +218,21 @@ export default function IngestPage() {
         setChapterStates((prev) => {
           const next = [...prev];
           if (!next[index]) return prev;
-          if (phase === "ingest") next[index] = { ...next[index], phase: "ingesting" };
-          else if (phase === "ingested")
+          if (phase === "ingest") {
+            // Belt-and-suspenders: when a NEW chapter starts ingesting,
+            // any earlier row still visually stuck on "analyzing" gets
+            // promoted to "ingested". Fixes the stuck-analyzing UI bug.
+            for (let j = 0; j < index; j++) {
+              if (next[j]?.phase === "analyzing") {
+                next[j] = { ...next[j], phase: "ingested" };
+              }
+            }
+            next[index] = { ...next[index], phase: "ingesting" };
+          } else if (phase === "ingested") {
             next[index] = { ...next[index], phase: "ingested" };
-          else if (phase === "analyze")
+          } else if (phase === "analyze") {
             next[index] = { ...next[index], phase: "analyzing" };
+          }
           return next;
         });
         return;
@@ -220,8 +240,20 @@ export default function IngestPage() {
       case "contradictions": {
         const incomingFlags = (data.flags as Flag[]) ?? [];
         const afterTitle = data.afterTitle as string | undefined;
-        setFlags(incomingFlags);
+        // E: accumulate + dedup instead of overwrite. Dedup key = quoted span.
+        setFlags((prev) => {
+          const seen = new Set(prev.map((f) => f.new_scene_span));
+          const merged = [...prev];
+          for (const f of incomingFlags) {
+            if (!seen.has(f.new_scene_span)) {
+              seen.add(f.new_scene_span);
+              merged.push(f);
+            }
+          }
+          return merged;
+        });
         setFlagsAfterTitle(afterTitle ?? null);
+        setAnalyzerPasses((n) => n + 1);
         return;
       }
       case "error": {
@@ -408,9 +440,13 @@ export default function IngestPage() {
             strategy={strategy}
             done={done}
           />
-          {flags.length > 0 && (
-            <ContradictionsPanel flags={flags} afterTitle={flagsAfterTitle} />
-          )}
+          <ContradictionsPanel
+            flags={flags}
+            afterTitle={flagsAfterTitle}
+            analyzerPasses={analyzerPasses}
+            analysisMode={analysisMode}
+            done={done}
+          />
         </div>
       )}
     </main>
@@ -542,22 +578,61 @@ function ChapterRow({ state }: { state: ChapterState }) {
   );
 }
 
-function ContradictionsPanel({ flags, afterTitle }: { flags: Flag[]; afterTitle: string | null }) {
+function ContradictionsPanel({
+  flags,
+  afterTitle,
+  analyzerPasses,
+  analysisMode,
+  done,
+}: {
+  flags: Flag[];
+  afterTitle: string | null;
+  analyzerPasses: number;
+  analysisMode: string | null;
+  done: boolean;
+}) {
+  const hasFlags = flags.length > 0;
+  const hasRun = analyzerPasses > 0 || done;
+  const borderColor = hasFlags
+    ? "var(--contradiction, #ff6b6b)"
+    : "var(--border)";
   return (
-    <div className="card" style={{ marginTop: 16, borderColor: "var(--contradiction, #ff6b6b)" }}>
+    <div className="card" style={{ marginTop: 16, borderColor }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-        <AlertTriangle size={18} color="var(--contradiction, #ff6b6b)" />
+        <AlertTriangle
+          size={18}
+          color={hasFlags ? "var(--contradiction, #ff6b6b)" : "var(--text-muted)"}
+        />
         <div>
           <div style={{ fontWeight: 600 }}>
-            {flags.length} contradiction{flags.length === 1 ? "" : "s"} so far
+            {hasFlags
+              ? `${flags.length} contradiction${flags.length === 1 ? "" : "s"} found`
+              : hasRun
+                ? "No contradictions detected"
+                : "Analyzer will run when the doc finishes ingesting…"}
           </div>
           {afterTitle && (
             <div className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
               after: {afterTitle}
+              {analysisMode && ` · mode: ${analysisMode}`}
             </div>
           )}
         </div>
       </div>
+      {!hasFlags && hasRun && (
+        <div
+          className="mono"
+          style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.6 }}
+        >
+          Opus read the whole document and found no factual conflicts.
+          {analysisMode === "full-text-only"
+            ? " The analyzer looked at your document end-to-end for pairs of statements that contradict each other."
+            : " The analyzer sampled across every ingested section."}
+          If you expected a flag here, the contradicting facts may not be
+          worded clearly enough for the model — try being more specific
+          (e.g. explicit character attributes, exact dates, precise locations).
+        </div>
+      )}
       <div style={{ display: "grid", gap: 10 }}>
         {flags.map((f, i) => (
           <div
