@@ -130,58 +130,133 @@ export default function IngestPage() {
         handleUploadUrl: "/api/blob",
       });
 
-      setStatusLine("Uploaded. Streaming chapter ingestion…");
-
-      // Step 2: open SSE stream
-      const res = await fetch("/api/chapters/stream-ingest", {
+      // Step 2: kick off the job — server parses, splits, and enqueues
+      setStatusLine("Uploaded. Parsing document…");
+      const startRes = await fetch("/api/job/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          blob_url: blob.url,
-          filename: file.name,
-        }),
+        body: JSON.stringify({ blob_url: blob.url, filename: file.name }),
       });
-      if (!res.ok || !res.body) {
-        throw new Error(await readErrorMessage(res));
-      }
+      if (!startRes.ok) throw new Error(await readErrorMessage(startRes));
+      const start = (await startRes.json()) as {
+        job_id: string;
+        totalBatches: number;
+        totalChapters: number;
+        totalWords: number;
+        strategy: string;
+      };
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = "";
+      // Seed UI with batch skeletons so the progress bar shows meaningful state
+      setTotalChapters(start.totalBatches);
+      setStrategy(start.strategy);
+      setAnalysisMode("cognee-sweep");
+      setChapterStates(
+        Array.from({ length: start.totalBatches }, (_, i) => ({
+          index: i,
+          title: `Batch ${i + 1}`,
+          phase: "pending",
+        })),
+      );
+      setStatusLine(
+        `${start.totalChapters} chapter${start.totalChapters === 1 ? "" : "s"} → ${start.totalBatches} batch${start.totalBatches === 1 ? "" : "es"}. Ingesting…`,
+      );
 
-      // Parse SSE frames
-      while (true) {
-        const { done: readerDone, value } = await reader.read();
-        if (readerDone) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        // Split on double-newline (SSE frame separator)
-        const frames = buffer.split(/\r?\n\r?\n/);
-        buffer = frames.pop() ?? "";
-
-        for (const frame of frames) {
-          if (!frame.trim()) continue;
-          let event = "message";
-          let dataStr = "";
-          for (const line of frame.split(/\r?\n/)) {
-            if (line.startsWith("event:")) event = line.slice(6).trim();
-            else if (line.startsWith("data:")) dataStr += line.slice(5).trim();
+      // Step 3: polling loop — call /tick to advance work, /GET to read state.
+      //         Each tick is <55s and does ONE unit of work (ingest a batch,
+      //         run a sweep, or normalize). Under Vercel Hobby 60s cap.
+      const POLL_INTERVAL_MS = 2500;
+      let consecutiveNoops = 0;
+      let doneSeen = false;
+      while (!doneSeen) {
+        const [statusRes, tickRes] = await Promise.all([
+          fetch(`/api/job/${start.job_id}`),
+          fetch(`/api/job/${start.job_id}/tick`, { method: "POST" }),
+        ]);
+        if (statusRes.ok) {
+          const j = (await statusRes.json()) as JobStatus;
+          applyJobStatus(j);
+          if (j.job?.state === "done") {
+            doneSeen = true;
+            break;
           }
-          if (!dataStr) continue;
-          let data: Record<string, unknown> = {};
-          try {
-            data = JSON.parse(dataStr) as Record<string, unknown>;
-          } catch {
-            continue;
+          if (j.job?.state === "error") {
+            setStatusLine(`Error: ${j.job.error ?? "job errored"}`);
+            break;
           }
-          handleEvent(event, data);
         }
+        if (tickRes.ok) {
+          const t = (await tickRes.json()) as { did?: string; error?: string };
+          if (t.did === "noop") consecutiveNoops++;
+          else consecutiveNoops = 0;
+          if (t.did === "done") {
+            doneSeen = true;
+            break;
+          }
+        }
+        // Safety: 30 noops in a row = server thinks nothing to do but we're not done
+        if (consecutiveNoops >= 30) {
+          setStatusLine("Stalled — no work available but not marked done. Try refreshing.");
+          break;
+        }
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       }
+
+      // Final state pull so flags render
+      const final = await fetch(`/api/job/${start.job_id}`);
+      if (final.ok) applyJobStatus((await final.json()) as JobStatus);
     } catch (e) {
       setStatusLine(`Error: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setVerb(null);
-      // Don't wipe stream state — user wants to see the results.
+    }
+  }
+
+  interface JobStatus {
+    job?: {
+      state: string;
+      error?: string;
+      total_chapters?: number;
+      strategy?: string;
+    };
+    batches?: Array<{ idx: number; title: string; state: string; error: string | null }>;
+    sweeps?: Array<{ kind: string; state: string }>;
+    flags?: Flag[];
+    progress?: { ingested_pct: number; overall_pct: number };
+  }
+
+  function applyJobStatus(j: JobStatus) {
+    if (j.job) {
+      if (j.job.state === "sweeping") setStatusLine("Ingestion complete. Running Cognee contradiction sweeps…");
+      else if (j.job.state === "normalizing") setStatusLine("Normalizing contradiction results…");
+      else if (j.job.state === "done") {
+        setStatusLine("Done.");
+        setDone(true);
+      } else if (j.job.state === "error") setStatusLine(`Error: ${j.job.error ?? "job errored"}`);
+    }
+    if (j.batches) {
+      setChapterStates(
+        j.batches.map((b) => ({
+          index: b.idx,
+          title: b.title,
+          phase:
+            b.state === "queued"
+              ? "pending"
+              : b.state === "ingesting"
+                ? "ingesting"
+                : b.state === "ingested"
+                  ? "ingested"
+                  : "error",
+          errorMsg: b.error ?? undefined,
+        })),
+      );
+    }
+    if (j.flags && j.flags.length > 0) {
+      setFlags(j.flags);
+      setFlagsAfterTitle("full-document sweep");
+      setAnalyzerPasses((n) => Math.max(n, 1));
+    } else if (j.job?.state === "done") {
+      // Explicit zero-contradictions signal
+      setAnalyzerPasses((n) => Math.max(n, 1));
     }
   }
 
