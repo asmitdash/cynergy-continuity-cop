@@ -114,6 +114,21 @@ export async function POST(
         return NextResponse.json({ did: "sweep", kind: sweep.kind });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
+        // Cognee returns 404 "Recall prerequisites not met" when cognify is
+        // still in progress in the background. That's transient — don't mark
+        // as fatal error; requeue so the next tick retries after a wait.
+        const isNotCognified =
+          msg.includes("Recall prerequisites not met") ||
+          msg.includes("recall 404");
+        if (isNotCognified) {
+          const { requeueSweep } = await import("@/lib/job-store");
+          await requeueSweep(jobId, sweep.kind);
+          return NextResponse.json({
+            did: "sweep-wait-cognify",
+            kind: sweep.kind,
+            message: "Cognee still building graph; will retry next tick.",
+          });
+        }
         await markSweepError(jobId, sweep.kind, msg);
         return NextResponse.json({ did: "sweep-error", kind: sweep.kind, error: msg });
       }

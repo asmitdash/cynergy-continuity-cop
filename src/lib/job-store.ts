@@ -277,13 +277,19 @@ export async function insertSweeps(jobId: string, kinds: string[]): Promise<void
 export async function claimNextQueuedSweep(
   jobId: string,
 ): Promise<{ kind: string } | null> {
+  // Claim rows that are queued OR were left in 'running' more than 2 minutes
+  // ago (previous tick timed out under the Vercel 60s cap).
   const r = await q<{ kind: string }>(
     `UPDATE continuity_sweeps
         SET state = 'running', updated_at = NOW()
       WHERE (job_id, kind) = (
         SELECT job_id, kind FROM continuity_sweeps
-        WHERE job_id = $1 AND state = 'queued'
-        ORDER BY kind ASC
+        WHERE job_id = $1
+          AND (
+            state = 'queued'
+            OR (state = 'running' AND updated_at < NOW() - INTERVAL '2 minutes')
+          )
+        ORDER BY (state = 'queued') DESC, kind ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED
       )
@@ -291,6 +297,19 @@ export async function claimNextQueuedSweep(
     [jobId],
   );
   return r.rows[0] ?? null;
+}
+
+/**
+ * Reset a sweep back to 'queued' so the next tick will claim and rerun it.
+ * Used when we want to retry a previous error (e.g. Cognee not yet cognified).
+ */
+export async function requeueSweep(jobId: string, kind: string): Promise<void> {
+  await q(
+    `UPDATE continuity_sweeps
+        SET state = 'queued', error = NULL, updated_at = NOW()
+      WHERE job_id = $1 AND kind = $2`,
+    [jobId, kind],
+  );
 }
 
 export async function saveSweep(
