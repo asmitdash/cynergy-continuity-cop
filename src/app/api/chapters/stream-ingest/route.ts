@@ -2,8 +2,7 @@ import { NextRequest } from "next/server";
 import { del } from "@vercel/blob";
 import { remember, recall, type SearchType } from "@/lib/cognee";
 import { callOpus } from "@/lib/bedrock";
-import { extractChapters } from "@/lib/pdf-split";
-import { CONTRADICTION_DETECT_SYSTEM, contradictionUserPrompt } from "@/lib/prompts";
+import { extractChapters, batchChapters } from "@/lib/pdf-split";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -21,17 +20,12 @@ function sseFrame(event: string, data: unknown): Uint8Array {
   return enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-/**
- * Above this section count, we skip per-chapter analysis and run ONE final
- * contradiction pass at the end. Massively cheaper on Cognee credits + faster.
- * (D + A fixes.)
- */
-const PER_CHAPTER_ANALYZER_MAX = 12;
+// Parallel ingestion concurrency. Higher = faster but more Cognee load.
+const INGEST_CONCURRENCY = 5;
 
-/**
- * When running per-chapter analysis, cap total analyzer calls to protect credits.
- */
-const MAX_ANALYZER_CALLS = 20;
+// Words per batch when concatenating small chapters into one remember() call.
+// Cuts credit cost roughly N-fold where N = chapters-per-batch.
+const BATCH_TARGET_WORDS = 20000;
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
@@ -44,6 +38,7 @@ export async function POST(req: NextRequest) {
   }
 
   const datasetId = process.env.DEMO_DATASET_ID!;
+  const uploadId = `up_${Date.now()}`;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -52,6 +47,7 @@ export async function POST(req: NextRequest) {
       };
 
       try {
+        // 1. Download bytes
         send("status", { phase: "download", message: `Fetching ${filename}…` });
         const fetched = await fetch(blob_url);
         if (!fetched.ok) throw new Error(`blob fetch failed: ${fetched.status}`);
@@ -61,6 +57,7 @@ export async function POST(req: NextRequest) {
           message: `Downloaded ${(buffer.length / 1024).toFixed(0)} KB`,
         });
 
+        // 2. Split into chapters (no hard cap)
         send("status", { phase: "split", message: "Extracting chapters…" });
         const isPdf = filename.toLowerCase().endsWith(".pdf");
         let chapters: Array<{ title: string; content: string; wordCount: number }> = [];
@@ -87,174 +84,114 @@ export async function POST(req: NextRequest) {
           strategy = "single";
         }
 
-        // Build the full-text view up front — we'll use this for the analyzer
-        // regardless of chapter count. This is the "just read the whole thing"
-        // path: for small docs, one Opus call finds every internal contradiction
-        // without needing Cognee at all.
-        const fullText = chapters.map((c) => c.content).join("\n\n");
-
-        // Decide analysis mode up-front so the UI can render the right affordance.
-        //  - "full-text-only": doc is small enough that we just hand it to Opus
-        //     directly. No Cognee round-trips for the analyzer. Zero Cognee credits.
-        //     Ingestion still happens so the doc lives in your memory graph.
-        //  - "per-chapter": moderate size, we run rolling cross-chapter checks
-        //  - "final-pass": large doc, one big analyzer at the end
-        const SMALL_DOC_MAX_WORDS = 15000;
-        const isSmallDoc = totalWords <= SMALL_DOC_MAX_WORDS;
-        const perChapterAnalyze =
-          !isSmallDoc && chapters.length <= PER_CHAPTER_ANALYZER_MAX;
-        const analysisMode = isSmallDoc
-          ? "full-text-only"
-          : perChapterAnalyze
-            ? "per-chapter"
-            : "final-pass";
+        // 3. Batch chapters so we make fewer, larger Cognee calls
+        const batches = batchChapters(chapters, BATCH_TARGET_WORDS);
 
         send("split", {
           totalChapters: chapters.length,
           totalPages,
           totalWords,
           strategy,
-          analysisMode,
+          totalBatches: batches.length,
+          batchConcurrency: INGEST_CONCURRENCY,
           titles: chapters.map((c) => c.title),
+          analysisMode: "cognee-sweep",
         });
 
-        // 3. Ingest phase — always sequential, but never analyze during ingest
-        //    when the doc is large. Fires cognee.remember(runInBackground=true)
-        //    which returns fast; Cognee cognifies in the background.
-        const ingestedTitles: string[] = [];
-        let analyzerCalls = 0;
-        for (let i = 0; i < chapters.length; i++) {
-          const ch = chapters[i];
-          const chapterId = `ch_${Date.now()}_${i}`;
+        // 4. Ingest batches in parallel with a concurrency cap.
+        //    Each batch → one Cognee.remember() call with node_set tags.
+        const batchStates = batches.map((b, i) => ({
+          index: i,
+          title: b.title,
+          wordCount: b.wordCount,
+          phase: "pending" as "pending" | "ingesting" | "ingested" | "error",
+        }));
 
-          send("progress", {
-            index: i,
-            total: chapters.length,
-            phase: "ingest",
-            title: ch.title,
-            wordCount: ch.wordCount,
-          });
-
-          try {
-            const rememberResult = await remember({
-              data: {
-                text: `# ${ch.title}\n\nChapter ID: ${chapterId}\n\n${ch.content}`,
-                filename: `${chapterId}.md`,
-              },
-              datasetId,
-              nodeSet: [
-                `chapter_id:${chapterId}`,
-                `chapter_order:${i}`,
-                `chapter_title:${ch.title}`,
-                `source_file:${filename}`,
-                "kind:chapter",
-                "kind:file_upload",
-              ],
-              runInBackground: true,
-            });
-            ingestedTitles.push(ch.title);
-
-            send("progress", {
-              index: i,
-              total: chapters.length,
-              phase: "ingested",
-              title: ch.title,
-              cognee_status: rememberResult.status,
-            });
-          } catch (e) {
-            send("error", {
-              index: i,
-              title: ch.title,
-              message: e instanceof Error ? e.message : String(e),
-            });
-            continue;
-          }
-
-          // Per-chapter contradiction sweep. For chapters 2..N, we check against
-          // everything ingested so far (cross-chapter contradictions). For the
-          // very first chapter, we run a SELF-CONSISTENCY pass — checking the
-          // chapter's own facts against each other. Single-chapter uploads
-          // NEED this or contradictions inside one document are never found.
-          if (perChapterAnalyze && analyzerCalls < MAX_ANALYZER_CALLS) {
-            send("progress", {
-              index: i,
-              total: chapters.length,
-              phase: "analyze",
-              title: ch.title,
-            });
-            try {
-              const flags =
-                i === 0
-                  ? await analyzeSelfConsistency(ch.content)
-                  : await analyzeContradictions(datasetId, ch.content);
-              analyzerCalls++;
-              send("contradictions", {
-                afterChapter: i,
-                afterTitle: ch.title,
-                chapters_ingested: ingestedTitles,
-                flags,
-              });
+        let inflight = 0;
+        let next = 0;
+        let finished = 0;
+        await new Promise<void>((resolve) => {
+          const tick = () => {
+            while (inflight < INGEST_CONCURRENCY && next < batches.length) {
+              const i = next++;
+              inflight++;
+              const b = batches[i];
+              batchStates[i].phase = "ingesting";
               send("progress", {
                 index: i,
-                total: chapters.length,
-                phase: "ingested",
-                title: ch.title,
+                total: batches.length,
+                phase: "ingest",
+                title: b.title,
+                wordCount: b.wordCount,
               });
-            } catch (e) {
-              send("error", {
-                index: i,
-                title: ch.title,
-                phase: "analyze",
-                message: e instanceof Error ? e.message : String(e),
-              });
-            }
-          }
-        }
 
-        // FULL-TEXT ANALYZER — the primary path for small docs.
-        //
-        // For small docs we don't do per-chapter analysis at all. Instead we
-        // hand Opus the ENTIRE document text and ask it to find internal
-        // contradictions. This is what a human reader would do. No Cognee
-        // round-trips, no splitting artifacts, no "well, I'm on chapter 2 so
-        // I can't see chapter 1" gaps.
-        //
-        // For large docs, we ALSO run this at the end — same idea, but on a
-        // sampled seed of chapter openers so it fits in the LLM context.
-        if (analysisMode === "full-text-only" || analysisMode === "final-pass") {
-          send("status", {
-            phase: "final-analysis",
-            message:
-              analysisMode === "full-text-only"
-                ? "Reading the document end-to-end for contradictions…"
-                : `Running final contradiction analysis across ${ingestedTitles.length} sections…`,
-          });
-          try {
-            const analyzerInput =
-              analysisMode === "full-text-only"
-                ? fullText
-                : buildFinalAnalyzerSeed(chapters);
-            const flags = await analyzeSelfConsistency(analyzerInput);
-            send("contradictions", {
-              afterChapter: chapters.length - 1,
-              afterTitle: "full-text analysis",
-              chapters_ingested: ingestedTitles,
-              flags,
-              final: true,
-            });
-          } catch (e) {
-            send("error", {
-              phase: "final-analysis",
-              message: e instanceof Error ? e.message : String(e),
-            });
-          }
-        }
+              const batchId = `${uploadId}_b${i}`;
+              remember({
+                data: {
+                  text: `# ${b.title}\n\nBatch ID: ${batchId}\n\n${b.content}`,
+                  filename: `${batchId}.md`,
+                },
+                datasetId,
+                nodeSet: [
+                  `upload_id:${uploadId}`,
+                  `batch_id:${batchId}`,
+                  `batch_index:${i}`,
+                  `source_file:${filename}`,
+                  "kind:chapter",
+                  "kind:file_upload",
+                ],
+                runInBackground: true,
+              })
+                .then((res) => {
+                  batchStates[i].phase = "ingested";
+                  send("progress", {
+                    index: i,
+                    total: batches.length,
+                    phase: "ingested",
+                    title: b.title,
+                    cognee_status: res.status,
+                  });
+                })
+                .catch((err) => {
+                  batchStates[i].phase = "error";
+                  send("error", {
+                    index: i,
+                    title: b.title,
+                    message: err instanceof Error ? err.message : String(err),
+                  });
+                })
+                .finally(() => {
+                  inflight--;
+                  finished++;
+                  if (finished >= batches.length) resolve();
+                  else tick();
+                });
+            }
+          };
+          tick();
+        });
+
+        // 5. Two Cognee-native contradiction sweeps
+        send("status", {
+          phase: "sweep",
+          message: `Ingestion complete. Running contradiction analysis on your knowledge graph…`,
+        });
+
+        const flags = await cogneeContradictionSweep(datasetId, uploadId, send);
+
+        send("contradictions", {
+          afterTitle: "full-document sweep",
+          chapters_ingested: chapters.map((c) => c.title),
+          flags,
+          final: true,
+        });
 
         send("done", {
           totalChapters: chapters.length,
+          totalBatches: batches.length,
           strategy,
-          analysisMode,
-          analyzerCalls,
+          analysisMode: "cognee-sweep",
+          contradictionsFound: flags.length,
         });
       } catch (e) {
         send("error", {
@@ -282,111 +219,84 @@ export async function POST(req: NextRequest) {
 }
 
 /**
- * For the final-pass analyzer on large docs, sample the first ~500 words of
- * each ingested chapter so the analyzer's query captures cross-chapter facts
- * rather than only the last one. Keeps the Opus prompt manageable.
+ * Two-sweep contradiction detection using Cognee's own graph reasoning.
+ * No LLM sampling of raw text. Cognee's knowledge graph is the source of truth.
+ *
+ * Sweep 1: GRAPH_COMPLETION_COT — chain-of-thought reasoning over the graph.
+ *   Asks Cognee: "list every pair of facts that contradict, with citations."
+ *
+ * Sweep 2: TRIPLET_COMPLETION — structural (subject, predicate, object) view.
+ *   Finds structural contradictions (same subject+predicate, incompatible objects).
+ *
+ * Results are unioned + dedup'd by the quoted span.
  */
-function buildFinalAnalyzerSeed(
-  chapters: Array<{ title: string; content: string }>,
-): string {
-  const parts: string[] = [];
-  for (const ch of chapters) {
-    const snippet = ch.content
-      .replace(/\s+/g, " ")
-      .split(" ")
-      .slice(0, 500)
-      .join(" ");
-    parts.push(`[${ch.title}] ${snippet}`);
+async function cogneeContradictionSweep(
+  datasetId: string,
+  uploadId: string,
+  send: (event: string, data: unknown) => void,
+): Promise<Flag[]> {
+  const contradictionQuery = `Identify every pair of facts in this knowledge graph that CONTRADICT each other. For each contradiction, describe both facts and cite where each appears in the source. Be exhaustive — include every direct contradiction (character attributes stated differently in different places, timeline conflicts, location conflicts, possession conflicts, relationship conflicts). Return concrete quoted evidence, not summaries. If two statements say the same person did two incompatible things at the same time or place, that's a contradiction. If a character is described as left-handed in one place and right-handed in another, that's a contradiction. If a date is stated as X in one section and Y in another, that's a contradiction. Only flag FACTUAL contradictions, not stylistic differences.`;
+
+  const sweeps: Array<{ label: string; searchType: SearchType }> = [
+    { label: "graph-cot", searchType: "GRAPH_COMPLETION_COT" },
+    { label: "triplet", searchType: "TRIPLET_COMPLETION" },
+  ];
+
+  const sweepResults: Array<{ label: string; text: string }> = [];
+  for (const s of sweeps) {
+    send("status", { phase: "sweep", message: `Cognee ${s.searchType}…` });
+    try {
+      const items = await recall({
+        query: contradictionQuery,
+        datasetIds: [datasetId],
+        searchType: s.searchType,
+        nodeName: [`upload_id:${uploadId}`],
+        topK: 20,
+        includeReferences: true,
+      });
+      const joined = items.map((it) => it.text).join("\n\n");
+      sweepResults.push({ label: s.label, text: joined });
+    } catch (e) {
+      send("error", {
+        phase: "sweep",
+        sweep: s.label,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
-  return parts.join("\n\n").slice(0, 12000);
-}
 
-/**
- * Self-consistency pass: hand the WHOLE chapter to Opus and ask it to find
- * pairs of contradicting facts within the same text. No Cognee call — pure
- * LLM. This is the mode that catches "Sarah is left-handed on page 2 /
- * writes with her right hand on page 5" in a single-chapter upload.
- * Cost: 1 Opus call. Zero Cognee credits.
- */
-async function analyzeSelfConsistency(chapterText: string): Promise<Flag[]> {
-  const text = chapterText.slice(0, 12000);
-  const system = `You are a continuity checker. Given a chapter of prose, find every pair of factual statements within it that CONTRADICT each other — a character described one way in one paragraph and differently later, a location distance stated two ways, an object owned by two people, a timeline that doesn't add up, etc.
+  // Merge Cognee's outputs, then have Opus normalize them into the Flag JSON
+  // shape the UI expects. Cognee returns prose; Opus turns prose into structured
+  // findings. This is ONE Opus call, not per-chapter.
+  const merged = sweepResults
+    .filter((r) => r.text.trim().length > 0)
+    .map((r) => `[${r.label}]\n${r.text}`)
+    .join("\n\n===\n\n");
 
-Return a strict JSON array. Each item:
-{
-  "new_scene_span": "the later or contradicting quote (verbatim, short)",
-  "contradicts_fact": "the earlier or contradicted quote (verbatim, short)",
-  "contradiction_kind": "identity|location|time|possession|relationship|physical_attribute|causal",
-  "explanation": "one sentence, plain English",
-  "confidence": 0.0-1.0
-}
+  if (!merged) return [];
+
+  const opus = await callOpus({
+    system: `You are a normalizer. You receive Cognee's contradiction analysis of a document (prose text) and convert it into a strict JSON array of Flag objects for a UI to render.
+
+Each Flag has:
+- new_scene_span: string (a short quoted piece of text that IS the contradiction — try to use verbatim quotes from Cognee's analysis)
+- contradicts_fact: string (the other side of the contradiction — the fact this contradicts)
+- contradiction_kind: one of "identity" | "location" | "time" | "possession" | "relationship" | "physical_attribute" | "causal"
+- explanation: one plain-English sentence
+- confidence: number in [0, 1]
 
 Rules:
-- Only flag FACTUAL contradictions. Not tone shifts, not stylistic drift.
-- Both quotes must actually appear in the text.
-- Empty array is a valid answer when the chapter is internally consistent.
-- Return ONLY the JSON array. No prose, no code fences.`;
-  const user = `CHAPTER TEXT:
-<<<
-${text}
->>>
-
-Find every internal contradiction. Return the JSON array.`;
-
-  const opus = await callOpus({
-    system,
-    messages: [{ role: "user", content: user }],
-    maxTokens: 1024,
-  });
-
-  const match = opus.text.match(/\[[\s\S]*\]/);
-  if (!match) return [];
-  try {
-    return JSON.parse(match[0]) as Flag[];
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Cross-chapter contradiction: pull facts from Cognee graph, feed to Opus.
- * Single SearchType (GRAPH_COMPLETION) — TEMPORAL/TRIPLET had diminishing
- * returns per credit spent.
- */
-async function analyzeContradictions(
-  datasetId: string,
-  newChapterText: string,
-): Promise<Flag[]> {
-  const searchType: SearchType = "GRAPH_COMPLETION";
-  const querySlice = newChapterText.slice(0, 4000);
-
-  let retrievedContext = "(no prior facts retrieved yet)";
-  try {
-    const items = await recall({
-      query: `Facts contradicting: ${querySlice}`,
-      datasetIds: [datasetId],
-      searchType,
-      topK: 8,
-      includeReferences: true,
-    });
-    const chunks = items.map((it) => `[${searchType}] ${it.text}`);
-    if (chunks.length > 0) retrievedContext = chunks.join("\n\n");
-  } catch {
-    // Cognee failure is not fatal — Opus will just find nothing.
-  }
-
-  const opus = await callOpus({
-    system: CONTRADICTION_DETECT_SYSTEM,
+- Return ONLY the JSON array. No prose, no code fences.
+- Dedup: if two contradictions are the same, keep only one.
+- If Cognee returned no contradictions (e.g. "no contradictions found"), return [].
+- Do not invent contradictions Cognee didn't mention.`,
     messages: [
       {
         role: "user",
-        content: contradictionUserPrompt({
-          newSceneText: querySlice,
-          retrievedContext,
-        }),
+        content: `Cognee analysis:\n\n${merged}\n\nReturn the JSON array.`,
       },
     ],
-    maxTokens: 1024,
+    maxTokens: 3000,
   });
 
   const match = opus.text.match(/\[[\s\S]*\]/);
